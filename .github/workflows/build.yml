@@ -1,0 +1,126 @@
+name: Build
+
+# Sicherheit:
+# - Startet NUR per Hand (Run workflow). Fremde koennen ihn nicht ausloesen,
+#   auch nicht ueber Pull Requests oder Forks.
+# - Der App-Code liegt im privaten Repo und wird nur waehrend des Builds geholt.
+#   Er wird weder hochgeladen noch in die Logs geschrieben.
+# - SOURCE_TOKEN darf nur das private Repo LESEN, sonst nichts.
+# - Der Signierschluessel wird nie ausgegeben und am Ende geloescht.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Android-APK
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Privaten Code holen
+        uses: actions/checkout@v4
+        with:
+          repository: ibrahimcharfia/good-mornings
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Node einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Java 21 einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Android-Lizenzen
+        run: |
+          SDKM=$(ls -d $ANDROID_HOME/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+
+      - name: Abhaengigkeiten
+        run: |
+          npm install --no-audit --no-fund --silent
+          cp node_modules/@capacitor/core/dist/capacitor.js www/capacitor.js
+          cp node_modules/@capacitor/local-notifications/dist/plugin.js www/ln.js
+          cp node_modules/@capacitor/synapse/dist/synapse.js www/synapse.js
+          cp node_modules/@capacitor/filesystem/dist/plugin.js www/fs.js
+          cp node_modules/@capacitor/share/dist/plugin.js www/share-plugin.js
+          cp node_modules/@capacitor/browser/dist/plugin.js www/browser-plugin.js
+
+      - name: Code verschleiern (schwerer zu kopieren)
+        run: |
+          npx --yes terser@5.31.6 www/app.js -c -m -o www/app.min.js
+          node --check www/app.min.js
+          mv www/app.min.js www/app.js
+
+      - name: Version lesen
+        id: ver
+        run: |
+          V=$(grep -o "[0-9]\+\.[0-9]\+\.[0-9]\+" www/version.js | head -1)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V"
+
+      - name: Android-Projekt erzeugen
+        run: npx cap add android > /dev/null
+
+      - name: Icons
+        run: |
+          pip install --quiet pillow
+          python3 make_assets.py > /dev/null
+          npx @capacitor/assets generate --android --iconBackgroundColor '#FFFFFF' --iconBackgroundColorDark '#FFFFFF' --splashBackgroundColor '#EEF1F5' --splashBackgroundColorDark '#0F1420' > /dev/null
+
+      - name: Einstellungen, Vibration, Version
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<activity#<activity android:screenOrientation="portrait"#' "$MANIFEST"
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.VIBRATE" />\n    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />\n    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />\n</manifest>#' "$MANIFEST"
+          cp native/MainActivity.java android/app/src/main/java/com/goodmornings/app/MainActivity.java
+          cp native/GMVibePlugin.java android/app/src/main/java/com/goodmornings/app/GMVibePlugin.java
+          GRADLE=android/app/build.gradle
+          V="${{ steps.ver.outputs.version }}"
+          CODE=$(echo "$V" | awk -F. '{print $1*1000000+$2*1000+$3}')
+          sed -i "s/versionCode 1$/versionCode $CODE/; s/versionName \"1.0\"/versionName \"$V\"/" "$GRADLE"
+          grep -c "versionCode $CODE" "$GRADLE"
+
+      - name: Web-Dateien uebernehmen
+        run: npx cap sync android > /dev/null
+
+      - name: Festen Signierschluessel einsetzen
+        run: |
+          test -f native/debug.keystore.b64
+          base64 -d native/debug.keystore.b64 > android/app/gm-release.keystore
+          GRADLE=android/app/build.gradle
+          sed -i '0,/^android {/s//android {\n    signingConfigs { debug { storeFile file("gm-release.keystore"); storePassword "android"; keyAlias "androiddebugkey"; keyPassword "android" } }/' "$GRADLE"
+
+      - name: APK bauen
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon -q
+          cp app/build/outputs/apk/debug/app-debug.apk ../Good-Mornings.apk
+          keytool -printcert -jarfile ../Good-Mornings.apk | grep "SHA256:"
+
+      - name: Schluessel und Code entfernen
+        if: always()
+        run: |
+          rm -f android/app/gm-release.keystore native/debug.keystore.b64 native/debug.keystore
+
+      - name: Veroeffentlichen (fuer die Update-Pruefung in der App)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Good Mornings ${{ steps.ver.outputs.version }}
+          body: "Neue Version ${{ steps.ver.outputs.version }}. In der App auf Laden tippen, dann installieren."
+          files: Good-Mornings.apk
+          make_latest: true
